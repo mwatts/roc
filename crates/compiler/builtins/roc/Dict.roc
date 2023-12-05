@@ -26,9 +26,6 @@ interface Dict
         removeAll,
         map,
         joinMap,
-        # TODO: remove once these are used in dict impl
-        bitMaskWalk,
-        bitMaskWalkUntil,
     ]
     imports [
         Bool.{ Bool, Eq },
@@ -96,13 +93,12 @@ interface Dict
 ## It has a list of keys value pairs that is ordered based on insertion.
 ## It uses a list of indices into the data as the backing of a hash map.
 Dict k v := {
-    # TODO: Add hashflooding ordered map fall back.
-    # TODO: Add Groups and SIMD h1 key comparison (initial tests where slower, but with proper SIMD should be fast).
+    # TODO: Add hashflooding ordered map fall back?
+    # TODO: Add SIMD h1 key comparison (initial tests where slower, but with proper SIMD should be fast).
     # TODO: As an optimization, we can make all of these lists in one allocation
-    # TODO: Grow data with the rest of the hashmap. This will require creating a list of garbage data.
-    # TODO: Change remove to use tombstones. Store the tombstones in a bitmap.
-    # TODO: define Eq and Hash that are unordered. Only if value implements hash/eq?
-    metadata : List I8,
+    # TODO: Grow data with the rest of the hashmap. This will require creating a list of garbage data. Probably not worth it but can test.
+    # TODO: Change remove to use tombstones. Store the tombstones in a bitmap. Probably not worth it but can test.
+    metadata : List Group,
     dataIndices : List Nat,
     data : List (k, v),
 } where k implements Hash & Eq
@@ -139,7 +135,7 @@ toInspectorDict = \dict ->
     fmt <- Inspect.custom
     Inspect.apply (Inspect.dict dict walk Inspect.toInspector Inspect.toInspector) fmt
 
-emptyMetadata = [emptySlot, emptySlot, emptySlot, emptySlot, emptySlot, emptySlot, emptySlot, emptySlot]
+emptyMetadata = [groupAllEmpty]
 emptyDataIndices = [0, 0, 0, 0, 0, 0, 0, 0]
 
 ## Return an empty dictionary.
@@ -175,7 +171,7 @@ withCapacity = \size ->
             |> Num.toNat
 
         @Dict {
-            metadata: List.repeat emptySlot cap,
+            metadata: List.repeat groupAllEmpty (div8 cap),
             dataIndices: List.repeat 0 cap,
             data: List.withCapacity cap,
         }
@@ -274,7 +270,7 @@ clear = \@Dict { metadata, dataIndices, data } ->
         empty {}
     else
         @Dict {
-            metadata: List.map metadata (\_ -> emptySlot),
+            metadata: List.map metadata (\_ -> groupAllEmpty),
             # just leave data indicies as garbage, no need to clear.
             dataIndices,
             # use takeFirst to keep around the capacity.
@@ -286,6 +282,7 @@ clear = \@Dict { metadata, dataIndices, data } ->
 ## new dictionary containing the same keys and the converted values.
 map : Dict k a, (k, a -> b) -> Dict k b where k implements Hash & Eq, b implements Hash & Eq
 map = \dict, transform ->
+    # TODO: couldn't this be done inplace? Since keys don't change it shouldn't have to touch the metadata.
     init = withCapacity (capacity dict)
 
     walk dict init \answer, k, v ->
@@ -410,9 +407,9 @@ get = \@Dict { metadata, dataIndices, data }, key ->
         |> complete
     h1Key = h1 hashKey
     h2Key = h2 hashKey
-    probe = newProbe h1Key (div8 (List.len metadata))
+    probe = newProbe h1Key (List.len metadata)
 
-    when findIndexHelper metadata dataIndices data h2Key key probe 0 is
+    when findIndexHelper metadata dataIndices data h2Key key probe is
         Ok index ->
             dataIndex = listGetUnsafe dataIndices index
             (_, v) = listGetUnsafe data dataIndex
@@ -438,9 +435,9 @@ contains = \@Dict { metadata, dataIndices, data }, key ->
         |> complete
     h1Key = h1 hashKey
     h2Key = h2 hashKey
-    probe = newProbe h1Key (div8 (List.len metadata))
+    probe = newProbe h1Key (List.len metadata)
 
-    when findIndexHelper metadata dataIndices data h2Key key probe 0 is
+    when findIndexHelper metadata dataIndices data h2Key key probe is
         Ok _ ->
             Bool.true
 
@@ -463,9 +460,9 @@ insert = \@Dict { metadata, dataIndices, data }, key, value ->
         |> complete
     h1Key = h1 hashKey
     h2Key = h2 hashKey
-    probe = newProbe h1Key (div8 (List.len metadata))
+    probe = newProbe h1Key (List.len metadata)
 
-    when findIndexHelper metadata dataIndices data h2Key key probe 0 is
+    when findIndexHelper metadata dataIndices data h2Key key probe is
         Ok index ->
             dataIndex = listGetUnsafe dataIndices index
 
@@ -508,16 +505,21 @@ remove = \@Dict { metadata, dataIndices, data }, key ->
         |> complete
     h1Key = h1 hashKey
     h2Key = h2 hashKey
-    probe = newProbe h1Key (div8 (List.len metadata))
+    probe = newProbe h1Key (List.len metadata)
 
-    when findIndexHelper metadata dataIndices data h2Key key probe 0 is
+    when findIndexHelper metadata dataIndices data h2Key key probe is
         Ok index ->
             last = Num.subWrap (List.len data) 1
             dataIndex = listGetUnsafe dataIndices index
 
             if dataIndex == last then
+                slotIndex = div8 index
+                offset = Num.bitwiseAnd index 0b0111_1111
+
+                group = listGetUnsafe metadata slotIndex
+                newGroup = groupSetDeletedAtOffset group (Num.toU8 offset)
                 @Dict {
-                    metadata: List.set metadata index deletedSlot,
+                    metadata: List.set metadata slotIndex newGroup,
                     dataIndices,
                     data: List.dropLast data 1,
                 }
@@ -703,9 +705,9 @@ swapAndUpdateDataIndex = \@Dict { metadata, dataIndices, data }, removedIndex, l
         |> complete
     h1Key = h1 hashKey
     h2Key = h2 hashKey
-    probe = newProbe h1Key (div8 (List.len metadata))
+    probe = newProbe h1Key (List.len metadata)
 
-    when findIndexHelper metadata dataIndices data h2Key key probe 0 is
+    when findIndexHelper metadata dataIndices data h2Key key probe is
         Ok index ->
             dataIndex = listGetUnsafe dataIndices removedIndex
             # Swap and remove data.
@@ -714,9 +716,14 @@ swapAndUpdateDataIndex = \@Dict { metadata, dataIndices, data }, removedIndex, l
                 |> List.swap dataIndex lastIndex
                 |> List.dropLast 1
 
+            slotIndex = div8 removedIndex
+            offset = Num.bitwiseAnd removedIndex 0b0111_1111
+
+            group = listGetUnsafe metadata slotIndex
+            newGroup = groupSetDeletedAtOffset group (Num.toU8 offset)
             @Dict {
                 # Set old metadata as deleted.
-                metadata: List.set metadata removedIndex deletedSlot,
+                metadata: List.set metadata slotIndex newGroup,
                 # Update index of swaped element.
                 dataIndices: List.set dataIndices index dataIndex,
                 data: nextData,
@@ -726,64 +733,66 @@ swapAndUpdateDataIndex = \@Dict { metadata, dataIndices, data }, removedIndex, l
             # This should be impossible.
             crash "unreachable state in dict swapAndUpdateDataIndex hit. Definitely a standard library bug."
 
-insertNotFoundHelper : Dict k v, k, v, U64, I8 -> Dict k v
+insertNotFoundHelper : Dict k v, k, v, U64, H2 -> Dict k v
 insertNotFoundHelper = \@Dict { metadata, dataIndices, data }, key, value, h1Key, h2Key ->
-    probe = newProbe h1Key (div8 (List.len metadata))
-    index = nextEmptyOrDeletedHelper metadata probe 0
+    probe = newProbe h1Key (List.len metadata)
+    index = nextEmptyOrDeletedHelper metadata probe
     dataIndex = List.len data
     nextData = List.append data (key, value)
 
+    slotIndex = div8 index
+    offset = Num.bitwiseAnd index 0b0111_1111
+
+    group = listGetUnsafe metadata slotIndex
+    newGroup = groupSetKeyAtOffset group (Num.toU8 offset) h2Key
     @Dict {
-        metadata: List.set metadata index h2Key,
+        metadata: List.set metadata slotIndex newGroup,
         dataIndices: List.set dataIndices index dataIndex,
         data: nextData,
     }
 
-nextEmptyOrDeletedHelper : List I8, Probe, Nat -> Nat
-nextEmptyOrDeletedHelper = \metadata, probe, offset ->
+nextEmptyOrDeletedHelper : List Group, Probe -> Nat
+nextEmptyOrDeletedHelper = \metadata, probe ->
     # For inserting, we can use deleted indices.
-    index = Num.addWrap (mul8 probe.slotIndex) offset
 
-    md = listGetUnsafe metadata index
-
-    if md < 0 then
-        # Empty or deleted slot, no possibility of the element.
+    group = listGetUnsafe metadata probe.slotIndex
+    emptyOrDeletedMask = groupMatchEmptyOrDeleted group
+    if bitMaskAny emptyOrDeletedMask then
+        offset = bitMaskLowestSet emptyOrDeletedMask
+        index = Num.addWrap (mul8 probe.slotIndex) (Num.toNat offset)
         index
-    else if offset == 7 then
-        nextEmptyOrDeletedHelper metadata (nextProbe probe) 0
     else
-        nextEmptyOrDeletedHelper metadata probe (Num.addWrap offset 1)
+        nextEmptyOrDeletedHelper metadata (nextProbe probe)
 
 # TODO: investigate if this needs to be split into more specific helper functions.
 # There is a chance that returning specific sub-info like the value would be faster.
-findIndexHelper : List I8, List Nat, List (k, v), I8, k, Probe, Nat -> Result Nat [NotFound] where k implements Hash & Eq
-findIndexHelper = \metadata, dataIndices, data, h2Key, key, probe, offset ->
-    # For finding a value, we must search past all deleted element tombstones.
-    index = Num.addWrap (mul8 probe.slotIndex) offset
+findIndexHelper : List Group, List Nat, List (k, v), H2, k, Probe -> Result Nat [NotFound] where k implements Hash & Eq
+findIndexHelper = \metadata, dataIndices, data, h2Key, key, probe ->
+    group = listGetUnsafe metadata probe.slotIndex
 
-    md = listGetUnsafe metadata index
+    h2Match = groupMatch group h2Key
+    found =
+        bitMaskWalkUntil h2Match (Err NotFound) \_, offset ->
+            index = Num.addWrap (mul8 probe.slotIndex) (Num.toNat offset)
+            dataIndex = listGetUnsafe dataIndices index
+            # TODO: Since we can load the value here should we return it too?
+            # We are loading the cache line either way.
+            (k, _) = listGetUnsafe data dataIndex
+            if k == key then
+                # we have a match, return its value
+                Break (Ok index)
+            else
+                Continue (Err NotFound)
 
-    if md == emptySlot then
-        # Empty slot, no possibility of the element.
-        Err NotFound
-    else if md == h2Key then
-        # Potentially matching slot, check if the key is a match.
-        dataIndex = listGetUnsafe dataIndices index
-        (k, _) = listGetUnsafe data dataIndex
-
-        if k == key then
-            # We have a match, return its index.
-            Ok index
-        else if offset == 7 then
-            # No match, keep checking.
-            findIndexHelper metadata dataIndices data h2Key key (nextProbe probe) 0
-        else
-            findIndexHelper metadata dataIndices data h2Key key probe (Num.addWrap offset 1)
-    else if offset == 7 then
-        # Used slot, check next slot.
-        findIndexHelper metadata dataIndices data h2Key key (nextProbe probe) 0
-    else
-        findIndexHelper metadata dataIndices data h2Key key probe (Num.addWrap offset 1)
+    when found is
+        Ok index -> Ok index
+        Err NotFound ->
+            if bitMaskAny (groupMatchEmpty group) then
+                # Group contains an empty slot, definitely not found
+                Err NotFound
+            else
+                # Group is full, check next group
+                findIndexHelper metadata dataIndices data h2Key key (nextProbe probe)
 
 # This is how we grow the container.
 # If we aren't to the load factor yet, just ignore this.
@@ -806,29 +815,32 @@ rehash = \@Dict { metadata, dataIndices, data } ->
     newLen = 2 * List.len dataIndices
     newDict =
         @Dict {
-            metadata: List.repeat emptySlot newLen,
+            metadata: List.repeat groupAllEmpty (div8 newLen),
             dataIndices: List.repeat 0 newLen,
             data,
         }
 
     rehashHelper newDict metadata dataIndices data 0
 
-rehashHelper : Dict k v, List I8, List Nat, List (k, v), Nat -> Dict k v where k implements Hash & Eq
-rehashHelper = \dict, oldMetadata, oldDataIndices, oldData, index ->
-    when List.get oldMetadata index is
-        Ok md ->
+rehashHelper : Dict k v, List Group, List Nat, List (k, v), Nat -> Dict k v where k implements Hash & Eq
+rehashHelper = \dict, oldMetadata, oldDataIndices, oldData, slotIndex ->
+    # TODO: Change to List.walkWithIndex?
+    when List.get oldMetadata slotIndex is
+        Ok group ->
+            matchFull = groupMatchFull group
             nextDict =
-                if md >= 0 then
-                    # We have an actual element here
-                    dataIndex = listGetUnsafe oldDataIndices index
-                    (k, _) = listGetUnsafe oldData dataIndex
-
-                    insertForRehash dict k dataIndex
-                else
-                    # Empty or deleted data
+                bitMaskWalk
+                    matchFull
                     dict
+                    (\currentDict, offset ->
+                        index = Num.addWrap (mul8 slotIndex) (Num.toNat offset)
+                        dataIndex = listGetUnsafe oldDataIndices index
+                        (k, _) = listGetUnsafe oldData dataIndex
 
-            rehashHelper nextDict oldMetadata oldDataIndices oldData (Num.addWrap index 1)
+                        insertForRehash currentDict k dataIndex
+                    )
+
+            rehashHelper nextDict oldMetadata oldDataIndices oldData (Num.addWrap slotIndex 1)
 
         Err OutOfBounds ->
             # Walked entire list, complete now.
@@ -842,17 +854,22 @@ insertForRehash = \@Dict { metadata, dataIndices, data }, key, dataIndex ->
         |> complete
     h1Key = h1 hashKey
     h2Key = h2 hashKey
-    probe = newProbe h1Key (div8 (List.len metadata))
-    index = nextEmptyOrDeletedHelper metadata probe 0
+    probe = newProbe h1Key (List.len metadata)
+    index = nextEmptyOrDeletedHelper metadata probe
 
+    slotIndex = div8 index
+    offset = Num.bitwiseAnd index 0b0111_1111
+
+    group = listGetUnsafe metadata slotIndex
+    newGroup = groupSetKeyAtOffset group (Num.toU8 offset) h2Key
     @Dict {
-        metadata: List.set metadata index h2Key,
+        metadata: List.set metadata slotIndex newGroup,
         dataIndices: List.set dataIndices index dataIndex,
         data,
     }
 
-emptySlot : I8
-emptySlot = -128
+# emptySlot : I8
+# emptySlot = -128
 deletedSlot : I8
 deletedSlot = -2
 
@@ -884,9 +901,12 @@ h1 = \hashKey ->
 
 H2 := U8 implements [Eq, Inspect]
 
-h2 : U64 -> I8
+h2 : U64 -> H2
 h2 = \hashKey ->
-    Num.toI8 (Num.bitwiseAnd hashKey 0b0111_1111)
+    hashKey
+    |> Num.bitwiseAnd 0b0111_1111
+    |> Num.toU8
+    |> @H2
 
 expect
     val =
@@ -1001,14 +1021,21 @@ expect
     keys dict == [2]
 
 expect
-    list =
+    dict =
         fromList [(1u8, 1u8), (2u8, 2u8), (3, 3)]
         |> remove 1
         |> insert 0 0
         |> remove 3
-        |> keys
 
-    list == [0, 2]
+    keys dict == [0, 2]
+
+expect
+    dict =
+        fromList [(1u8, 1u8), (2u8, 2u8), (3, 3)]
+        |> remove 3
+        |> remove 2
+
+    keys dict == [1]
 
 # Reach capacity, no rehash.
 expect
@@ -1603,8 +1630,8 @@ expect
 # TODO: Change inspect for Group and BitMask to print bytes.
 Group := U64 implements [Eq, Inspect]
 
-# allEmpty : Group
-# allEmpty = @Group 0x8080_8080_8080_8080
+groupAllEmpty : Group
+groupAllEmpty = @Group 0x8080_8080_8080_8080
 
 # All of these group matching functions could use SSE and probably merit adding bitcode functions.
 groupMatch : Group, H2 -> BitMask
@@ -1668,8 +1695,8 @@ expect
     result = groupSetDeletedAtOffset g 3
     result == @Group 0x8023_FE80_FE80_8023
 
-groupUpdateKeyAtOffset : Group, U8, H2 -> Group
-groupUpdateKeyAtOffset = \@Group g, offset, @H2 updateVal ->
+groupSetKeyAtOffset : Group, U8, H2 -> Group
+groupSetKeyAtOffset = \@Group g, offset, @H2 updateVal ->
     bitOffset = mul8 offset
     mask = Num.bitwiseNot (Num.toU64 (Num.shiftLeftBy 0xFF bitOffset))
     shiftedUpdate = Num.shiftLeftBy (Num.toNat updateVal) bitOffset
@@ -1677,7 +1704,7 @@ groupUpdateKeyAtOffset = \@Group g, offset, @H2 updateVal ->
 
 expect
     g = @Group 0x8023_FE80_2480_8023
-    result = groupUpdateKeyAtOffset g 7 (@H2 0x77)
+    result = groupSetKeyAtOffset g 7 (@H2 0x77)
     result == @Group 0x7723_FE80_2480_8023
 
 BitMask := U64 implements [Eq, Inspect]

@@ -26,6 +26,9 @@ interface Dict
         removeAll,
         map,
         joinMap,
+        # TODO: remove once these are used in dict impl
+        bitMaskWalk,
+        bitMaskWalkUntil,
     ]
     imports [
         Bool.{ Bool, Eq },
@@ -879,6 +882,8 @@ h1 : U64 -> U64
 h1 = \hashKey ->
     Num.shiftRightZfBy hashKey 7
 
+H2 := U8 implements [Eq, Inspect]
+
 h2 : U64 -> I8
 h2 = \hashKey ->
     Num.toI8 (Num.bitwiseAnd hashKey 0b0111_1111)
@@ -1592,3 +1597,152 @@ expect
         |> Dict.insert 3 3
 
     d1 == d2
+
+## Internal types and functions for Dict metadata.
+
+# TODO: Change inspect for Group and BitMask to print bytes.
+Group := U64 implements [Eq, Inspect]
+
+# allEmpty : Group
+# allEmpty = @Group 0x8080_8080_8080_8080
+
+# All of these group matching functions could use SSE and probably merit adding bitcode functions.
+groupMatch : Group, H2 -> BitMask
+groupMatch = \@Group g, @H2 h ->
+    msbs = 0x8080808080808080
+    lsbs = 0x0101010101010101
+    x = Num.bitwiseXor g (lsbs * (Num.toU64 h))
+    y = Num.bitwiseAnd msbs (Num.bitwiseNot x)
+    @BitMask (Num.bitwiseAnd (Num.subWrap x lsbs) y)
+
+expect
+    g = @Group 0x8023_FE80_2480_8023
+    key = @H2 0x23
+    result = groupMatch g key
+    result == @BitMask 0x0080_0000_0000_0080
+
+groupMatchFull : Group -> BitMask
+groupMatchFull = \@Group g ->
+    msbs = 0x8080808080808080
+    ng = Num.bitwiseNot g
+    @BitMask (Num.bitwiseAnd ng msbs)
+
+expect
+    g = @Group 0x8023_FE80_2480_8023
+    result = groupMatchFull g
+    result == @BitMask 0x0080_0000_8000_0080
+
+groupMatchEmpty : Group -> BitMask
+groupMatchEmpty = \@Group g ->
+    msbs = 0x8080808080808080
+    ng = Num.bitwiseNot g
+    x = Num.bitwiseAnd g (Num.shiftLeftBy ng 6)
+    @BitMask (Num.bitwiseAnd x msbs)
+
+expect
+    g = @Group 0x8023_FE80_2480_8023
+    result = groupMatchEmpty g
+    result == @BitMask 0x8000_0080_0080_8000
+
+groupMatchEmptyOrDeleted : Group -> BitMask
+groupMatchEmptyOrDeleted = \@Group g ->
+    msbs = 0x8080808080808080
+    ng = Num.bitwiseNot g
+    x = Num.bitwiseAnd g (Num.shiftLeftBy ng 7)
+    @BitMask (Num.bitwiseAnd x msbs)
+
+expect
+    g = @Group 0x8023_FE80_2480_8023
+    result = groupMatchEmptyOrDeleted g
+    result == @BitMask 0x8000_8080_0080_8000
+
+groupSetDeletedAtOffset : Group, U8 -> Group
+groupSetDeletedAtOffset = \@Group g, offset ->
+    bitOffset = mul8 offset
+    mask = Num.bitwiseNot (Num.toU64 (Num.shiftLeftBy 0xFF bitOffset))
+    shiftedUpdate = Num.shiftLeftBy (Num.toNat deletedSlot) bitOffset
+    @Group (Num.bitwiseOr (Num.bitwiseAnd g (Num.toU64 mask)) (Num.toU64 shiftedUpdate))
+
+expect
+    g = @Group 0x8023_FE80_2480_8023
+    result = groupSetDeletedAtOffset g 3
+    result == @Group 0x8023_FE80_FE80_8023
+
+groupUpdateKeyAtOffset : Group, U8, H2 -> Group
+groupUpdateKeyAtOffset = \@Group g, offset, @H2 updateVal ->
+    bitOffset = mul8 offset
+    mask = Num.bitwiseNot (Num.toU64 (Num.shiftLeftBy 0xFF bitOffset))
+    shiftedUpdate = Num.shiftLeftBy (Num.toNat updateVal) bitOffset
+    @Group (Num.bitwiseOr (Num.bitwiseAnd g (Num.toU64 mask)) (Num.toU64 shiftedUpdate))
+
+expect
+    g = @Group 0x8023_FE80_2480_8023
+    result = groupUpdateKeyAtOffset g 7 (@H2 0x77)
+    result == @Group 0x7723_FE80_2480_8023
+
+BitMask := U64 implements [Eq, Inspect]
+
+bitMaskLowestSet : BitMask -> U8
+bitMaskLowestSet = \@BitMask mask ->
+    mask
+    |> Num.countTrailingZeroBits
+    |> div8
+
+expect
+    mask = @BitMask 0x8000
+    bitMaskLowestSet mask == 1
+
+bitMaskNext : BitMask -> BitMask
+bitMaskNext = \@BitMask mask ->
+    mask
+    |> Num.subWrap 1
+    |> Num.bitwiseAnd mask
+    |> @BitMask
+
+expect
+    mask = @BitMask 0x8080
+    bitMaskNext mask == @BitMask 0x8000
+
+bitMaskAny : BitMask -> Bool
+bitMaskAny = \@BitMask mask ->
+    mask != 0
+
+bitMaskWalk : BitMask, state, (state, U8 -> state) -> state
+bitMaskWalk = \mask, state, callback ->
+    if bitMaskAny mask then
+        offset = bitMaskLowestSet mask
+        nextState = callback state offset
+        nextMask = bitMaskNext mask
+        bitMaskWalk nextMask nextState callback
+    else
+        state
+
+expect
+    mask = @BitMask 0x8000_8080
+    result = bitMaskWalk mask [] List.append
+    result == [0, 1, 3]
+
+bitMaskWalkUntil : BitMask, state, (state, U8 -> [Break state, Continue state]) -> state
+bitMaskWalkUntil = \mask, state, callback ->
+    if bitMaskAny mask then
+        offset = bitMaskLowestSet mask
+        when callback state offset is
+            Continue nextState ->
+                nextMask = bitMaskNext mask
+                bitMaskWalkUntil nextMask nextState callback
+
+            Break nextState ->
+                nextState
+    else
+        state
+
+expect
+    mask = @BitMask 0x8000_8080
+    result = bitMaskWalkUntil mask [] \lst, offset ->
+        if offset < 2 then
+            List.append lst offset
+            |> Continue
+        else
+            Break lst
+    result == [0, 1]
+

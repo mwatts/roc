@@ -697,8 +697,8 @@ removeAll = \xs, ys ->
     walk ys xs (\state, k, _ -> remove state k)
 
 swapAndUpdateDataIndex : Dict k v, Nat, Nat -> Dict k v where k implements Hash & Eq
-swapAndUpdateDataIndex = \@Dict { metadata, dataIndices, data }, removedIndex, lastIndex ->
-    (key, _) = listGetUnsafe data lastIndex
+swapAndUpdateDataIndex = \@Dict { metadata, dataIndices, data }, removedIndex, lastDataIndex ->
+    (key, _) = listGetUnsafe data lastDataIndex
     hashKey =
         createLowLevelHasher PseudoRandSeed
         |> Hash.hash key
@@ -707,13 +707,13 @@ swapAndUpdateDataIndex = \@Dict { metadata, dataIndices, data }, removedIndex, l
     h2Key = h2 hashKey
     probe = newProbe h1Key (List.len metadata)
 
-    when findIndexHelper metadata dataIndices data h2Key key probe is
+    when findIndexHelperKnownDataIndex metadata dataIndices h2Key key probe lastDataIndex is
         Ok index ->
             dataIndex = listGetUnsafe dataIndices removedIndex
             # Swap and remove data.
             nextData =
                 data
-                |> List.swap dataIndex lastIndex
+                |> List.swap dataIndex lastDataIndex
                 |> List.dropLast 1
 
             slotIndex = div8 removedIndex
@@ -764,8 +764,6 @@ nextEmptyOrDeletedHelper = \metadata, probe ->
     else
         nextEmptyOrDeletedHelper metadata (nextProbe probe)
 
-# TODO: investigate if this needs to be split into more specific helper functions.
-# There is a chance that returning specific sub-info like the value would be faster.
 findIndexHelper : List Group, List Nat, List (k, v), H2, k, Probe -> Result Nat [NotFound] where k implements Hash & Eq
 findIndexHelper = \metadata, dataIndices, data, h2Key, key, probe ->
     group = listGetUnsafe metadata probe.slotIndex
@@ -793,6 +791,33 @@ findIndexHelper = \metadata, dataIndices, data, h2Key, key, probe ->
             else
                 # Group is full, check next group
                 findIndexHelper metadata dataIndices data h2Key key (nextProbe probe)
+
+# This helper avoids an extra memory lookup when we know the data index.
+# We no longer need to load the data index and check keys.
+findIndexHelperKnownDataIndex : List Group, List Nat, H2, k, Probe, Nat -> Result Nat [NotFound] where k implements Hash & Eq
+findIndexHelperKnownDataIndex = \metadata, dataIndices, h2Key, key, probe, expectedDataIndex ->
+    group = listGetUnsafe metadata probe.slotIndex
+
+    h2Match = groupMatch group h2Key
+    found =
+        bitMaskWalkUntil h2Match (Err NotFound) \_, offset ->
+            index = Num.addWrap (mul8 probe.slotIndex) (Num.toNat offset)
+            dataIndex = listGetUnsafe dataIndices index
+            if dataIndex == expectedDataIndex then
+                # we have a match, return its value
+                Break (Ok index)
+            else
+                Continue (Err NotFound)
+
+    when found is
+        Ok index -> Ok index
+        Err NotFound ->
+            if bitMaskAny (groupMatchEmpty group) then
+                # Group contains an empty slot, definitely not found
+                Err NotFound
+            else
+                # Group is full, check next group
+                findIndexHelperKnownDataIndex metadata dataIndices h2Key key (nextProbe probe) expectedDataIndex
 
 # This is how we grow the container.
 # If we aren't to the load factor yet, just ignore this.

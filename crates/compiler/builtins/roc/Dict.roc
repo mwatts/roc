@@ -93,6 +93,10 @@ interface Dict
 ## It has a list of keys value pairs that is ordered based on insertion.
 ## It uses a list of indices into the data as the backing of a hash map.
 Dict k v := {
+    # TODO: Look at switching to being based off martinus unordered dense map: https://github.com/martinus/unordered_dense
+    #       The absl flat map in an index map requires an extra lookup for the data index.
+    #       This is quite bad for perf cause it is generally a cache miss.
+    #       The martinus unordered map merges the data index and metadata which avoids this.
     # TODO: Add hashflooding ordered map fall back?
     # TODO: Add SIMD h1 key comparison (initial tests where slower, but with proper SIMD should be fast).
     # TODO: As an optimization, we can make all of these lists in one allocation

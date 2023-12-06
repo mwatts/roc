@@ -765,22 +765,26 @@ nextEmptyOrDeletedHelper = \metadata, probe ->
         nextEmptyOrDeletedHelper metadata (nextProbe probe)
 
 findIndexHelper : List Group, List Nat, List (k, v), H2, k, Probe -> Result Nat [NotFound] where k implements Hash & Eq
-findIndexHelper = \metadata, dataIndices, data, h2Key, key, probe ->
+findIndexHelper = \metadata, dataIndices0, data0, h2Key, key, probe ->
     group = listGetUnsafe metadata probe.slotIndex
 
     h2Match = groupMatch group h2Key
-    found =
-        bitMaskWalkUntil h2Match (Err NotFound) \_, offset ->
+    # This weird threading of data and dataIndices through the walk is to avoid refcount increments in a hot loop
+    # Long term, hopefully roc can be smarter about this and avoid the cost.
+    # Closures that can borrow their captures instead of own them?
+    # Simply inline single use closures before calculating refcounting?
+    (data2, dataIndices2, found) =
+        bitMaskWalkUntil h2Match (data0, dataIndices0, Err NotFound) \(data1, dataIndices1, _), offset ->
             index = Num.addWrap (mul8 probe.slotIndex) (Num.toNat offset)
-            dataIndex = listGetUnsafe dataIndices index
+            dataIndex = listGetUnsafe dataIndices1 index
             # TODO: Since we can load the value here should we return it too?
             # We are loading the cache line either way.
-            (k, _) = listGetUnsafe data dataIndex
+            (k, _) = listGetUnsafe data1 dataIndex
             if k == key then
                 # we have a match, return its value
-                Break (Ok index)
+                Break (data1, dataIndices1, Ok index)
             else
-                Continue (Err NotFound)
+                Continue (data1, dataIndices1, Err NotFound)
 
     when found is
         Ok index -> Ok index
@@ -790,24 +794,28 @@ findIndexHelper = \metadata, dataIndices, data, h2Key, key, probe ->
                 Err NotFound
             else
                 # Group is full, check next group
-                findIndexHelper metadata dataIndices data h2Key key (nextProbe probe)
+                findIndexHelper metadata dataIndices2 data2 h2Key key (nextProbe probe)
 
 # This helper avoids an extra memory lookup when we know the data index.
 # We no longer need to load the data index and check keys.
 findIndexHelperKnownDataIndex : List Group, List Nat, H2, k, Probe, Nat -> Result Nat [NotFound] where k implements Hash & Eq
-findIndexHelperKnownDataIndex = \metadata, dataIndices, h2Key, key, probe, expectedDataIndex ->
+findIndexHelperKnownDataIndex = \metadata, dataIndices0, h2Key, key, probe, expectedDataIndex ->
     group = listGetUnsafe metadata probe.slotIndex
 
     h2Match = groupMatch group h2Key
-    found =
-        bitMaskWalkUntil h2Match (Err NotFound) \_, offset ->
+    # This weird threading of dataIndices through the walk is to avoid refcount increments in a hot loop
+    # Long term, hopefully roc can be smarter about this and avoid the cost.
+    # Closures that can borrow their captures instead of own them?
+    # Simply inline single use closures before calculating refcounting?
+    (dataIndices2, found) =
+        bitMaskWalkUntil h2Match (dataIndices0, Err NotFound) \(dataIndices1, _), offset ->
             index = Num.addWrap (mul8 probe.slotIndex) (Num.toNat offset)
-            dataIndex = listGetUnsafe dataIndices index
+            dataIndex = listGetUnsafe dataIndices1 index
             if dataIndex == expectedDataIndex then
                 # we have a match, return its value
-                Break (Ok index)
+                Break (dataIndices1, Ok index)
             else
-                Continue (Err NotFound)
+                Continue (dataIndices1, Err NotFound)
 
     when found is
         Ok index -> Ok index
@@ -817,7 +825,7 @@ findIndexHelperKnownDataIndex = \metadata, dataIndices, h2Key, key, probe, expec
                 Err NotFound
             else
                 # Group is full, check next group
-                findIndexHelperKnownDataIndex metadata dataIndices h2Key key (nextProbe probe) expectedDataIndex
+                findIndexHelperKnownDataIndex metadata dataIndices2 h2Key key (nextProbe probe) expectedDataIndex
 
 # This is how we grow the container.
 # If we aren't to the load factor yet, just ignore this.
